@@ -32,6 +32,10 @@ LeakSanitizer must run outside debugger/ptrace supervision. The 48 CTest cases c
 matching models, order lifecycles, allocation failures, output reuse, analytics,
 and CLI/CSV behavior. `BUILD_TESTING=OFF` omits test executables.
 
+Link-time optimization is optional and defaults OFF. Enable it with
+`cmake --preset release -DEXCHANGE_ENABLE_LTO=ON`, then rebuild. Configuration
+fails if the compiler/linker does not support it.
+
 ## Simulation and CSV analysis
 
 Scenario files begin with `SCENARIO 1`. For example:
@@ -64,6 +68,11 @@ at the final command; the default interval is 1. EXPECT lines do not advance the
 interval. CSV output overwrites the selected output path, protects the input file,
 and can be partial if the command exits with an error.
 
+The runner validates the final book. Add `--validate-every N` for an invariant
+scan every N commands (`--validate-every 1` checks each command). Debug builds
+also validate inside the engine after every command. Release defaults to the
+final scan to avoid repeatedly walking the entire book during large simulations.
+
 The demo executes 6 units at 101 and 2 at 103: volume 8, notional 812 tick-units,
 VWAP 101.5 ticks. [The expected CSV](fixtures/analysis_expected.csv) is a regression
 fixture. Metric definitions:
@@ -95,6 +104,9 @@ index locates orders for cancellation/replacement. Trades execute at maker price
 Same-price reductions retain priority; quantity increases and price changes lose
 priority and match again. Preparation reserves output and stages allocations before
 book mutation, so rejected replacement or preparation failure preserves the book.
+The engine retains the staging index's bucket storage. A replacement that rests
+again reuses its FIFO and index nodes, updating quantity and priority before
+appending at the destination level's tail.
 
 `ReferenceEngine::process()` returns owned output; `process_into()` reuses caller
 vectors. Consume/copy output before reusing it. Fill scratch is reused by default
@@ -103,6 +115,12 @@ capacity. Full `snapshot()` includes FIFO orders; `depth_snapshot()` copies only
 sorted prices/totals. `MarketAnalysis` consumes every result in sequence and derives
 metrics from a current snapshot. It uses reusable transaction storage and maintains
 no second order book. There is no networking or external historical-feed adapter.
+
+Checked arithmetic is header-only and `constexpr`, allowing inlining without LTO
+while preserving overflow guards. The fill-buffer switch is private to the library:
+the scratch-vector member always exists, keeping engine layout consistent for
+callers. OFF mode leaves it unused; benchmark metadata reads the actual library
+setting through `BuildInfo`.
 
 ## Performance tests
 

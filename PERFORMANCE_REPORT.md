@@ -1,69 +1,82 @@
 # Performance summary
 
-Recorded 2026-09-28 on Ubuntu 24.04/WSL2, Intel i5-8365U (4 cores/8 threads),
-GCC 13.3, CMake 3.28.3 and Ninja 1.11.1. Native timings use Release `-O3 -DNDEBUG`.
-Inputs/prefill, validation and CSV I/O are excluded; processing, output disposal and
-selected analytics are included. Synthetic workloads, unpinned CPU and WSL
-scheduling limit generalization. Values are batch medians, not latency percentiles.
+Measurements use Ubuntu 24.04/WSL2, Intel i5-8365U, GCC 13.3 and Release
+`-O3 -DNDEBUG`. Timings exclude generation, prefill, final validation and CSV I/O;
+processing, output disposal and selected analytics are included. Each invocation
+has an excluded warmup. Synthetic workloads and WSL scheduling limit generalization;
+values are batch medians, not latency percentiles. Compare paired experiments,
+not absolute times from different runs.
 
-## Matching buffers
+## Engine storage and matcher improvements — 2026-09-29
 
-Hypothesis: repeated fill-plan and result-vector allocations waste work. Retain
-engine scratch capacity and offer caller-owned `process_into()` output. Three
-rotating rounds × three trials, 100K commands per workload:
+Hypothesis: repeated allocation of staging buckets and replacement nodes wastes work.
+Reuse staging-index buckets and resting replacements' FIFO/index nodes, remove
+redundant matcher work and pass the already-found book into matching. Preparation
+still completes allocations before mutation; replacements preserve generation and
+receive new FIFO priority when required.
 
-| Workload | Original buffers | Fill reuse | Fill + output reuse | Combined reduction |
-| --- | ---: | ---: | ---: | ---: |
-| Match | 20.935 ms | 19.461 ms | 16.026 ms | 23.4% |
-| Four-level sweep | 84.269 ms | 76.284 ms | 69.834 ms | 17.1% |
-| Sustained, 10K live | 19.362 ms | 18.893 ms | 14.708 ms | 24.0% |
+GCC Release, LTO OFF, reusable output, CPU 2 pinned; 100K commands, 10K book-size
+parameter, five alternating before/after rounds × three trials:
 
-At 10K matching commands, ordinary allocations fell from 30000 to 3. **Keep both**:
-fill reuse defaults ON; output reuse is optional. Buffers retain their largest
-capacity. Fill-only gains were workload-dependent, with overlapping ranges in
-several cases; an earlier Windows sequential trial was slower with reuse.
+| Workload | Before median [IQR], ms | After median [IQR], ms | Reduction |
+| --- | ---: | ---: | ---: |
+| Add | 28.439 [26.558–32.431] | 21.979 [21.100–23.128] | 22.7% |
+| Reprice | 27.161 [25.645–28.605] | 13.201 [12.679–13.660] | 51.4% |
+| Diverse | 22.511 [20.217–24.788] | 16.072 [15.433–16.758] | 28.6% |
 
-## Large dataset and analyser
+Separate 10K-command diagnostics reduced ordinary allocation calls: add
+**30012 → 20012**, reprice **30003 → 3**, diverse **14005 → 6005**. The timings
+compare the combined changes, not individual commits. **Keep**: measured savings
+support the storage changes; retained scratch/bucket capacity uses some memory.
+The imported implementation passed all 48 existing tests in Release and optimized
+ASan/UBSan with leak detection, including allocation-failure/retry checks.
 
-One million commands, 100K live orders, four instruments, 800 occupied price levels,
-seed 20260928: 86570 distinct slots exercised, 200K trades, 600K units, zero rejections.
-Five rounds rotated analysis modes and alternated original/candidate execution.
+## Header arithmetic, stable layout and build controls
 
-| Experiment | Before median [range] | After median [range] | Decision |
-| --- | --- | --- | --- |
-| Replace per-result statistics-map copies with reusable aggregate vectors | 407.714 [365.937–435.116] ms | 298.920 [277.183–341.960] ms | Keep: 26.7% faster |
-| Replace full FIFO snapshots with aggregate depth snapshots, every 10K commands | 1663.636 [1615.556–1770.073] ms | 308.124 [280.828–321.107] ms | Keep: 81.5% faster |
+Checked arithmetic is now header-only `constexpr`, enabling inlining without LTO.
+The fill-reuse macro is private to the library; its vector member always exists,
+so callers see the same engine layout. Benchmark metadata reads the library's
+setting through `BuildInfo`. OFF mode retains an unused vector object.
 
-The snapshot comparison was a separate five-round experiment after aggregate reuse.
-All quote/depth/trade metrics agree across snapshot types. Reusable aggregates
-eliminate 4M allocations per 1M commands; ordinary allocation calls drop from
-5400005 to 1400005. Compact snapshots reduce cumulative requested bytes from
-423063048 to 100503048. They omit order-level detail; full snapshots remain available.
+Current source passed **48/48 tests each** in Release fill ON, Release fill OFF,
+and optimized ASan/UBSan with leak detection. All nine workloads passed 10K-command
+smoke runs in both modes; metadata matched the setting. Separate compile checks
+confirmed constexpr overflow handling and equal engine size (256 bytes on this
+platform) with either consumer macro setting. These smoke runs are not timing
+experiments. **Keep for inlining opportunity and layout consistency; no isolated
+speedup is claimed for this change.**
 
-LOB-only control medians were 281.084/282.477 ms, with overlapping ranges. Screening
-at 1K/10K/100K live orders gave 195.425/219.153/282.477 ms; larger books cost more in
-this workload. Snapshot cadence matters: at 100K live orders, observing every 1K
-commands cost 11942 ms with full copies versus 320 ms with compact depth.
+LTO remains opt-in (`EXCHANGE_ENABLE_LTO=ON`) with compiler support checked at
+configuration. The scenario runner validates once at completion in Release;
+`--validate-every N` enables periodic scans. Debug retains per-command engine scans.
+These controls avoid unnecessary scans and permit build comparisons; no new local
+isolated timing claim is made for them. The later book/output refactor is not yet
+part of this source.
 
-## Long run and correctness
+## Earlier buffer and analysis evidence — 2026-09-28
 
-Five million commands, 100K live orders, seed 42, three trials with depth observations
-every 10K commands: **1M trades, 3M units, zero rejections**, 99995 distinct slots.
-Median **1478.518 ms** (range 1478.120–1499.403), or **3.382M commands/second**.
-Peak process RSS was approximately **466 MiB**, including prebuilt commands and
-reserved engine storage. Lower cumulative allocation did not reduce that peak.
+These recorded development comparisons precede the staging/node changes above:
 
-The implementation passed **48/48 tests** in Release, Debug and optimized
-ASan/UBSan with leak detection. Checks cover independent matching models, full
-output equivalence, allocation failures/retries, overflow rollback, instrument
-isolation, snapshot equivalence and exact scenario CSVs. No pool or container
-rewrite was justified. Fresh Windows validation and hosted CI results are not claimed.
+| Hypothesis/change | Before → after median | Decision/trade-off |
+| --- | --- | --- |
+| Reuse fill scratch and caller output, 100K match commands | 20.935 → 16.026 ms | Keep; buffers retain peak capacity |
+| Reuse analysis aggregate vectors, 1M commands/100K live | 407.714 → 298.920 ms | Keep; eliminates 4M allocation calls |
+| Use aggregate depth instead of full FIFO snapshots every 10K commands | 1663.636 → 308.124 ms | Keep; omits order-level detail |
 
-Callgrind's former inflated call counts came from collection toggles retaining
-unmeasured shared-edge calls. START/STOP instrumentation with `--instr-atstart=no`
-correctly reports 10000 calls for 10000 measured commands. Instruction counts are
-not runtime or cache measurements.
+The analysis comparisons used five rotated rounds; exact trade and snapshot metrics
+agreed. The 1M-command diverse dataset produced 200K trades/600K units with zero
+rejections. A 5M-command depth run produced 1M trades/3M units, median 1478.518 ms,
+peak RSS about 466 MiB including prebuilt commands. A September 29 clean-source
+rerun also passed, but measured 3074.153 ms and 465.7 MiB. Neither run measures the
+latest arithmetic/layout change; cross-day timing differences do not establish a
+regression. Original raw development captures were removed during cleanup.
 
-[README](README.md#performance-tests) contains commands for the current workloads
-and comparison modes. Before-values above summarize recorded development
-experiments; transient builds, raw captures and debug logs were removed for submission.
+Callgrind's inflated counts were resolved with START/STOP instrumentation and
+`--instr-atstart=no`: 10000 measured commands report 10000 calls. Instruction counts
+do not establish runtime gains or cache behavior.
+
+[README](README.md#performance-tests) gives benchmark commands. Retained local
+logs/CSVs are under `build/results/`: `pr-1-review`, `implementation-commit`,
+`pr2-implementation-01`, and `2026-09-29-clean`. These are Git-ignored artifacts;
+this report preserves the concise findings. Current source retains 48 tests;
+additional upstream test suites and the book/output refactor remain deferred.
