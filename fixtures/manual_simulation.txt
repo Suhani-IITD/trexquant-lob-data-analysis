@@ -1,0 +1,6 @@
+SCENARIO 1
+# Two sellers at the same price. The earlier seller fills first.
+NEW 1 1 SELL LIMIT GTC 100 5
+NEW 2 1 SELL LIMIT GTC 100 5
+NEW 3 1 BUY LIMIT IOC 100 7
+# Remaining book: ask 100, order 2 with quantity 3. No EXPECT lines required.

@@ -1,0 +1,18 @@
+/build/
+/build-*/
+/CMakeUserPresets.json
+/compile_commands.json
+/.cache/
+/.vs/
+*.profraw
+*.profdata
+perf.data*
+
+# Local assistant/editor metadata and generated diagnostics
+/.agents/
+/.codex/
+/benchmark-results/
+callgrind.out*
+*.log
+.DS_Store
+Thumbs.db
