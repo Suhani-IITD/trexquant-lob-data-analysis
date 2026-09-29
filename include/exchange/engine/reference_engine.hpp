@@ -62,10 +62,13 @@ private:
     void process_cancel(const CommandEnvelope&, const CancelInput&, CommandResult&);
     // Phase 2: New and priority-losing Replace share one preflight/prepare/commit path.
     void process_replace(const CommandEnvelope&, const ReplaceInput&, CommandResult&);
-    void match_order(const CommandEnvelope&, const NewInput&, CommandResult&,
+    // The caller has already looked up the instrument's book; pass it rather than search again.
+    void match_order(const CommandEnvelope&, const NewInput&, ReferenceBook&, CommandResult&,
                               std::optional<OrderLocation> replaced_order = std::nullopt);
     void reject(const CommandEnvelope&, OrderIdentity, ExecutionStatus, RejectReason, CommandResult&) const;
-    void remove_order(const OrderLocation&);
+    // Unlinks an order, erasing its level if emptied. With keep, the FIFO node moves
+    // there and the index entry survives, so a resting replacement allocates neither.
+    void remove_order(const OrderLocation&, std::list<RestingOrder>* keep = nullptr);
     void emit_event(CommandResult&, InstrumentId, MarketEvent);
     void emit_report(CommandResult&, const CommandEnvelope&, SessionId, OrderIdentity,
                      ExecutionStatus, Quantity, Quantity, std::optional<PriceTicks>);
@@ -74,6 +77,8 @@ private:
     EpochId epoch_;
     std::map<InstrumentId, ReferenceBook> books_;
     ActiveIndex active_;
+    // Empty between commands; holds one prepared node only while a command is staged.
+    ActiveIndex staging_index_;
     std::size_t active_levels_{};
     IngressSequence last_ingress_{};
     MarketSequence last_market_{};

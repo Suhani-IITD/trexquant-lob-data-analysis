@@ -31,6 +31,7 @@ ReferenceEngine::ReferenceEngine(EngineConfig config, EpochId epoch)
     }
     active_.max_load_factor(0.7F);
     active_.reserve(config_.capacity.maximum_active_orders);
+    staging_index_.reserve(1);
 }
 
 CommandResult ReferenceEngine::process(const CommandEnvelope& command) {
@@ -119,15 +120,14 @@ void ReferenceEngine::process_new(const CommandEnvelope& command, const NewInput
     if (active_.contains(input.id)) {
         return rejected(RejectReason::DuplicateOrderId);
     }
-    return match_order(command, input, result);
+    return match_order(command, input, book, result);
 }
 
 // Phase 2: generalizes Phase 1's GTC matcher without duplicating fill/insert logic.
 // The optional replacement stays live throughout planning and preparation. Removing
 // it early would make a capacity/allocation failure destroy the original order.
-void ReferenceEngine::match_order(const CommandEnvelope& command, const NewInput& input, CommandResult& result,
-                                           std::optional<OrderLocation> replaced_order) {
-    auto& book = books_.at(input.instrument);
+void ReferenceEngine::match_order(const CommandEnvelope& command, const NewInput& input, ReferenceBook& book,
+                                           CommandResult& result, std::optional<OrderLocation> replaced_order) {
     const OrderIdentity taker{input.id, replaced_order ? replaced_order->order->generation
                                                      : OrderGeneration{command.ingress.value()}};
     const auto rejected = [&](RejectReason reason) {
@@ -143,22 +143,20 @@ void ReferenceEngine::match_order(const CommandEnvelope& command, const NewInput
 #else
     std::vector<PlannedFill> fills;
 #endif
+    // Nonzero on entry: process_new and process_replace reject zero quantity.
     auto remaining = input.quantity.value();
     std::size_t depleted_orders = 0;
     std::size_t depleted_levels = 0;
+    const auto limit = input.price;
     const auto scan = [&](const auto& levels) {
         for (const auto& [price, level] : levels) {
             // Phase 2: absence of a limit means traverse all available opposite prices.
-            const bool outside_limit = input.price &&
-                (input.side == Side::Buy ? price > *input.price : price < *input.price);
-            if (remaining == 0 || outside_limit) {
+            // The scanned side fixes the direction: key_comp(limit, price) means price is worse.
+            if (limit && levels.key_comp()(*limit, price)) {
                 break;
             }
             auto level_remaining = level.total.value();
             for (const auto& maker : level.fifo) {
-                if (remaining == 0) {
-                    break;
-                }
                 const auto executed = std::min(remaining, maker.remaining.value());
                 fills.push_back({maker.id, price, Quantity{executed}});
                 remaining -= executed;
@@ -166,9 +164,15 @@ void ReferenceEngine::match_order(const CommandEnvelope& command, const NewInput
                 if (executed == maker.remaining.value()) {
                     ++depleted_orders;
                 }
+                if (remaining == 0) {
+                    break;
+                }
             }
             if (level_remaining == 0) {
                 ++depleted_levels;
+            }
+            if (remaining == 0) {
+                break;
             }
         }
     };
@@ -189,8 +193,9 @@ void ReferenceEngine::match_order(const CommandEnvelope& command, const NewInput
     const bool removes_old_level = replaced_order && std::visit(
         [](auto handle) { return handle.level->second.fifo.size() == 1; }, replaced_order->level);
     const bool same_level = replaced_order && old_price == input.price;
-    auto bid = rests ? book.bids_.find(*input.price) : book.bids_.end();
-    auto ask = rests ? book.asks_.find(*input.price) : book.asks_.end();
+    // Only the taker's own side can receive the remainder.
+    auto bid = rests && input.side == Side::Buy ? book.bids_.find(*input.price) : book.bids_.end();
+    auto ask = rests && input.side == Side::Sell ? book.asks_.find(*input.price) : book.asks_.end();
     const bool missing_level = input.side == Side::Buy ? bid == book.bids_.end() : ask == book.asks_.end();
     const bool new_level = missing_level || (same_level && removes_old_level);
     auto prior_total = missing_level ? 0 : (input.side == Side::Buy ? bid->second.total.value()
@@ -198,7 +203,7 @@ void ReferenceEngine::match_order(const CommandEnvelope& command, const NewInput
     if (rests && same_level) {
         prior_total -= old_quantity.value();
     }
-    const auto final_total = checked_add(prior_total, resting_quantity);
+    const auto final_total = rests ? checked_add(prior_total, resting_quantity) : std::optional<std::uint64_t>{};
     const auto retained_orders = active_.size() - depleted_orders - (replaced_order ? 1U : 0U);
     const auto retained_levels = active_levels_ - depleted_levels - (removes_old_level ? 1U : 0U);
     if (rests &&
@@ -209,14 +214,13 @@ void ReferenceEngine::match_order(const CommandEnvelope& command, const NewInput
     }
     // Phase 2: at most two fixed reports (acknowledgement/expiry), plus two per fill;
     // at most two fixed events (replacement Cancel/remainder Add), plus one per fill.
-    if (fills.size() > (std::numeric_limits<std::size_t>::max() - 2) / 2) {
-        throw std::length_error("Command result size overflow");
-    }
+    // std::allocator caps fills.size() at SIZE_MAX / sizeof(PlannedFill), so neither count overflows.
+    static_assert(sizeof(PlannedFill) >= 3);
+    static_assert(std::numeric_limits<std::size_t>::max() <= std::numeric_limits<std::uint64_t>::max());
     const bool expires = !rests && remaining != 0;
     const auto report_count = 1 + 2 * fills.size() + (expires ? 1U : 0U);
     const auto event_count = fills.size() + (rests ? 1U : 0U) + (replaced_order ? 1U : 0U);
-    if (!std::in_range<std::uint64_t>(event_count) ||
-        !checked_add(last_market_.value(), static_cast<std::uint64_t>(event_count))) {
+    if (!checked_add(last_market_.value(), static_cast<std::uint64_t>(event_count))) {
         throw std::overflow_error("Market sequence exhausted");
     }
     result.reports.reserve(report_count);
@@ -227,9 +231,13 @@ void ReferenceEngine::match_order(const CommandEnvelope& command, const NewInput
     std::optional<BidLevels::node_type> staged_bid;
     std::optional<AskLevels::node_type> staged_ask;
     ActiveIndex::node_type staged_index;
+    // A resting replacement reuses its original FIFO and index nodes at commit instead.
+    const bool reuses_nodes = rests && replaced_order;
     if (rests) {
-        staged_orders.push_back({input.id, taker.generation, command.session, Quantity{remaining},
-                                 command.ingress});
+        if (!reuses_nodes) {
+            staged_orders.push_back({input.id, taker.generation, command.session, Quantity{remaining},
+                                     command.ingress});
+        }
         if (new_level && input.side == Side::Buy) {
             BidLevels staging;
             staging.try_emplace(*input.price, PriceLevel{*input.price, Quantity{}, {}});
@@ -239,9 +247,11 @@ void ReferenceEngine::match_order(const CommandEnvelope& command, const NewInput
             staging.try_emplace(*input.price, PriceLevel{*input.price, Quantity{}, {}});
             staged_ask.emplace(staging.extract(staging.begin()));
         }
-        ActiveIndex staging;
-        staging.emplace(input.id, OrderLocation{});
-        staged_index = staging.extract(input.id);
+        if (!reuses_nodes) {
+            // Member staging keeps its bucket array; a local map allocated one per resting order.
+            staging_index_.emplace(input.id, OrderLocation{});
+            staged_index = staging_index_.extract(input.id);
+        }
     }
 
     // Commit: no expected rejection or allocation remains. Unexpected invariant failure is fatal.
@@ -255,7 +265,14 @@ void ReferenceEngine::match_order(const CommandEnvelope& command, const NewInput
             auto& total = handle.level->second.total;
             total = Quantity{total.value() - old_quantity.value()};
         }, replaced_order->level);
-        remove_order(*replaced_order);
+        if (reuses_nodes) {
+            // Fills only touch the opposite side, so the unlinked node is safe until re-homed.
+            remove_order(*replaced_order, &staged_orders);
+            staged_orders.front().remaining = Quantity{remaining};
+            staged_orders.front().priority = command.ingress;
+        } else {
+            remove_order(*replaced_order);
+        }
         emit_event(result, input.instrument, CancelEvent{taker, old_quantity});
     }
     auto taker_remaining = input.quantity.value();
@@ -305,8 +322,12 @@ void ReferenceEngine::match_order(const CommandEnvelope& command, const NewInput
             ask->second.total = Quantity{*final_total};
             location.level = AskLocation{ask};
         }
-        staged_index.mapped() = location;
-        require(active_.insert(std::move(staged_index)).inserted, "Prepared order ID already exists");
+        if (reuses_nodes) {
+            active_.at(input.id) = location;
+        } else {
+            staged_index.mapped() = location;
+            require(active_.insert(std::move(staged_index)).inserted, "Prepared order ID already exists");
+        }
         emit_event(result, input.instrument,
                    AddEvent{taker, input.side, *input.price, Quantity{remaining}, command.ingress});
     }
@@ -342,7 +363,8 @@ void ReferenceEngine::process_replace(const CommandEnvelope& command,
     if (resting_order.owner != command.session) {
         return rejected(RejectReason::NotOwner);
     }
-    const auto& instrument = books_.at(location.instrument).config_;
+    auto& book = books_.at(location.instrument);
+    const auto& instrument = book.config_;
     if (input.new_price < instrument.minimum || input.new_price > instrument.maximum) {
         return rejected(RejectReason::InvalidPrice);
     }
@@ -373,7 +395,7 @@ void ReferenceEngine::process_replace(const CommandEnvelope& command,
     const auto side = std::holds_alternative<BidLocation>(location.level) ? Side::Buy : Side::Sell;
     const NewInput replacement{input.id, location.instrument, side, OrderType::Limit,
                                TimeInForce::GTC, input.new_price, input.new_remaining};
-    return match_order(command, replacement, result, location);
+    return match_order(command, replacement, book, result, location);
 }
 
 void ReferenceEngine::process_cancel(const CommandEnvelope& command, const CancelInput& input, CommandResult& result) {
@@ -411,14 +433,21 @@ void ReferenceEngine::process_cancel(const CommandEnvelope& command, const Cance
     return;
 }
 
-void ReferenceEngine::remove_order(const OrderLocation& location) {
+void ReferenceEngine::remove_order(const OrderLocation& location, std::list<RestingOrder>* keep) {
     const auto retained = location;
-    auto& book = books_.at(retained.instrument);
-    active_.erase(retained.order->id);
+    if (!keep) {
+        active_.erase(retained.order->id);
+    }
     std::visit([&](auto handle) {
         auto& level = handle.level->second;
-        level.fifo.erase(retained.order);
+        if (keep) {
+            keep->splice(keep->end(), level.fifo, retained.order);
+        } else {
+            level.fifo.erase(retained.order);
+        }
         if (level.fifo.empty()) {
+            // Only erasing the level needs its owning map.
+            auto& book = books_.at(retained.instrument);
             if constexpr (std::is_same_v<decltype(handle), BidLocation>) {
                 book.bids_.erase(handle.level);
             } else {

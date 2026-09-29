@@ -49,7 +49,8 @@ std::string_view reason_name(RejectReason reason) {
     throw std::logic_error("Unknown internal rejection code");
 }
 
-int run(const std::string& path, const std::optional<std::string>& csv_path, std::uint64_t cadence) {
+int run(const std::string& path, const std::optional<std::string>& csv_path, std::uint64_t cadence,
+        std::optional<std::uint64_t> validate_every) {
     std::ifstream input{path};
     require(input.is_open(), "Cannot open scenario: " + path);
     EngineConfig config{{{InstrumentId{1}, "XYZ", PriceTicks{1}, PriceTicks{10000},
@@ -167,7 +168,11 @@ int run(const std::string& path, const std::optional<std::string>& csv_path, std
             } else {
                 throw std::runtime_error("Unknown operation: " + operation);
             }
-            driver.engine().validate();
+            // Debug builds already validate every command inside the engine. A full scan per
+            // command makes Release runs quadratic, so it is opt-in here to localize a failure.
+            if (validate_every && commands % *validate_every == 0) {
+                driver.engine().validate();
+            }
             if (analysis) {
                 analysis->consume(*last);
                 if (commands % cadence == 0) { observe(driver.engine().depth_snapshot()); }
@@ -186,6 +191,9 @@ int run(const std::string& path, const std::optional<std::string>& csv_path, std
     }
     require(!input.bad(), "I/O failure while reading scenario");
     require(header && commands > 0, "Scenario needs a header and commands");
+    // Always checked once: runs are deterministic, so a failure here replays exactly under
+    // --validate-every 1 to find the first bad command.
+    driver.engine().validate();
     // Simulation output is useful without EXPECT directives or a verification pipeline.
     const auto final_state = driver.engine().snapshot();
     if (analysis) {
@@ -224,7 +232,7 @@ int run(const std::string& path, const std::optional<std::string>& csv_path, std
 int main(int argc, char* argv[]) {
     constexpr std::string_view usage =
         "Usage: scenario_runner --input <scenario.txt> [--analysis-csv <output.csv>] "
-        "[--observe-every <positive command count>]\n";
+        "[--observe-every <positive command count>] [--validate-every <positive command count>]\n";
     if (argc == 2 && std::string_view{argv[1]} == "--help") {
         std::cout << usage;
         return 0;
@@ -232,6 +240,7 @@ int main(int argc, char* argv[]) {
     std::optional<std::string> input, csv;
     std::uint64_t cadence = 1;
     bool cadence_set = false;
+    std::optional<std::uint64_t> validate_every;
     try {
         for (int i = 1; i < argc; i += 2) {
             require(i + 1 < argc, "Missing option value");
@@ -242,6 +251,9 @@ int main(int argc, char* argv[]) {
                 cadence = integer<std::uint64_t>(argv[i + 1]);
                 require(cadence > 0, "Observation interval must be positive");
                 cadence_set = true;
+            } else if (flag == "--validate-every" && !validate_every) {
+                validate_every = integer<std::uint64_t>(argv[i + 1]);
+                require(*validate_every > 0, "Validation interval must be positive");
             } else { throw std::runtime_error("Unknown or duplicate option"); }
         }
         require(input.has_value(), "Input scenario is required");
@@ -251,7 +263,7 @@ int main(int argc, char* argv[]) {
         return 2;
     }
     try {
-        return run(*input, csv, cadence);
+        return run(*input, csv, cadence, validate_every);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

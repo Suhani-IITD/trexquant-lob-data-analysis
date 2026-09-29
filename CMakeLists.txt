@@ -17,6 +17,17 @@ option(EXCHANGE_ENABLE_TSAN "Enable ThreadSanitizer (separate build)" OFF)
 option(EXCHANGE_ENABLE_CLANG_TIDY "Run clang-tidy when compiling project targets" OFF)
 option(EXCHANGE_REUSE_FILL_BUFFER "Reuse engine fill-planning scratch capacity" ON)
 option(EXCHANGE_ENABLE_CALLGRIND "Instrument benchmark measured regions for Linux Callgrind" OFF)
+option(EXCHANGE_ENABLE_LTO "Enable link-time optimization for all targets" OFF)
+
+if(EXCHANGE_ENABLE_LTO)
+    # Before target creation: CMAKE_INTERPROCEDURAL_OPTIMIZATION seeds each target's property.
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT EXCHANGE_IPO_SUPPORTED OUTPUT EXCHANGE_IPO_OUTPUT LANGUAGES CXX)
+    if(NOT EXCHANGE_IPO_SUPPORTED)
+        message(FATAL_ERROR "EXCHANGE_ENABLE_LTO requested but unsupported: ${EXCHANGE_IPO_OUTPUT}")
+    endif()
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+endif()
 
 include(cmake/CompilerWarnings.cmake)
 include(cmake/Sanitizers.cmake)
