@@ -401,11 +401,8 @@ int main(int argc, char* argv[]) {
                   << " seed=" << options.seed << '\n';
         std::cout << "# output=" << (options.reuse_output ? "reuse" : "value") << '\n';
         const auto info = build_info();
-#ifdef EXCHANGE_REUSE_FILL_BUFFER
-        std::cout << "# fill_buffer=reused (retains per-engine high-water capacity)\n";
-#else
-        std::cout << "# fill_buffer=per_command (baseline)\n";
-#endif
+        std::cout << (info.reuses_fill_buffer ? "# fill_buffer=reused (retains per-engine high-water capacity)\n"
+                                              : "# fill_buffer=per_command (baseline)\n");
         std::cout << "# version=" << info.version << " compiler=" << info.compiler << " build=" << info.configuration
                   << " workload_version=3 clock=steady_clock warmup_trials=1 book_size=" << options.book_size << '\n';
 #ifndef NDEBUG

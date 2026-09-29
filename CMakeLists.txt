@@ -40,7 +40,6 @@ add_library(exchange_core STATIC
     src/analysis/csv.cpp
     src/analysis/market_analysis.cpp
     src/core/build_info.cpp
-    src/core/checked_arithmetic.cpp
     src/core/config.cpp
     src/book/reference_book.cpp
     src/engine/reference_engine.cpp)
@@ -51,8 +50,8 @@ target_include_directories(exchange_core
     PRIVATE "${PROJECT_BINARY_DIR}/generated")
 target_compile_definitions(exchange_core PRIVATE EXCHANGE_BUILD_TYPE="$<CONFIG>")
 if(EXCHANGE_REUSE_FILL_BUFFER)
-    # Public because the option changes the engine's class layout.
-    target_compile_definitions(exchange_core PUBLIC EXCHANGE_REUSE_FILL_BUFFER=1)
+    # Private: the engine layout is fixed; library implementation files read the switch.
+    target_compile_definitions(exchange_core PRIVATE EXCHANGE_REUSE_FILL_BUFFER=1)
 endif()
 exchange_set_warnings(exchange_core)
 exchange_enable_sanitizers(exchange_core)

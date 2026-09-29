@@ -52,11 +52,10 @@ private:
         PriceTicks price;
         Quantity executed;
     };
-#ifdef EXCHANGE_REUSE_FILL_BUFFER
-    // Retain measured scratch capacity, never iterators; OFF builds provide a baseline.
-    // Clear before every plan, including after a rejected/failed preparation.
+    // Retain measured scratch capacity, never iterators; OFF builds leave it unused as a baseline.
+    // Clear before every plan, including after a rejected/failed preparation. Always declared,
+    // so the class layout does not depend on EXCHANGE_REUSE_FILL_BUFFER.
     std::vector<PlannedFill> fill_buffer_;
-#endif
     using ActiveIndex = std::unordered_map<OrderId, OrderLocation, OrderIdHash>;
     void process_new(const CommandEnvelope&, const NewInput&, CommandResult&);
     void process_cancel(const CommandEnvelope&, const CancelInput&, CommandResult&);
